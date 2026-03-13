@@ -53,6 +53,7 @@ class Tracking:
         "clearml",
         "trackio",
         "file",
+        "otel",
     ]
 
     def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
@@ -178,6 +179,9 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
+        if "otel" in default_backend:
+            self.logger["otel"] = _OtelAdapter(project_name, experiment_name, config)
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
@@ -198,6 +202,8 @@ class Tracking:
             self.logger["trackio"].finish()
         if "file" in self.logger:
             self.logger["file"].finish()
+        if "otel" in self.logger:
+            self.logger["otel"].finish()
 
 
 class ClearMLLogger:
@@ -532,3 +538,97 @@ class ValidationGenerationsLogger:
         self.writer.add_text("val/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+
+class _OtelAdapter:
+    def __init__(self, project_name, experiment_name, config=None):
+        from opentelemetry import metrics
+
+        self.meter = metrics.get_meter("verl")
+        self.instruments = {}
+        self.gauge_cache = {}  # (otel_name, attr_tuple) -> value
+        self.registered_gauges = set()
+
+        # Mapping from verl key to (otel_name, instrument_type, extra_attrs)
+        self.metric_map = {
+            "perf/throughput": ("rl.perf.throughput", "gauge", {}),
+            "perf/total_num_tokens": ("rl.train.tokens", "counter", {}),
+            "timing_s/step": ("rl.loop.duration", "histogram", {}),
+            "timing_s/gen": ("rl.sample.duration", "histogram", {}),
+            "critic/score/mean": ("rl.environment.reward.mean", "gauge", {}),
+            "response_length/mean": ("rl.environment.episode.length.mean", "gauge", {}),
+            "actor/reward_kl_penalty": ("rl.train.kl.mean", "gauge", {}),
+            "response/aborted_ratio": ("rl.sample.aborted_ratio", "gauge", {}),
+            "actor/loss": ("rl.train.loss", "gauge", {"rl.role": "actor"}),
+            "critic/loss": ("rl.train.loss", "gauge", {"rl.role": "critic"}),
+            "timing_s/update_actor": ("rl.train.duration", "histogram", {"rl.role": "actor"}),
+            "timing_s/update_critic": ("rl.train.duration", "histogram", {"rl.role": "critic"}),
+        }
+
+        self.common_attributes = {
+            "rl.system": "verl",
+            "rl.run.id": experiment_name,
+            "rl.algorithm": self._get_algo_from_config(config),
+        }
+
+        if config and "data" in config:
+            train_files = config["data"].get("train_files", "unknown")
+            self.common_attributes["rl.environment.name"] = str(train_files)
+
+    def _get_algo_from_config(self, config):
+        if not config:
+            return "unknown"
+        if hasattr(config, "algorithm") and hasattr(config.algorithm, "name"):
+            return config.algorithm.name
+        elif isinstance(config, dict) and "algorithm" in config:
+            return config["algorithm"].get("name", "unknown")
+        return "unknown"
+
+    def _get_instrument(self, name, type_):
+        if name in self.instruments:
+            return self.instruments[name]
+
+        if type_ == "counter":
+            inst = self.meter.create_counter(name)
+        elif type_ == "histogram":
+            inst = self.meter.create_histogram(name)
+        elif type_ == "gauge":
+            if name not in self.registered_gauges:
+
+                def callback(options):
+                    from opentelemetry.metrics import Observation
+
+                    for (m_name, attr_tuple), val in self.gauge_cache.items():
+                        if m_name == name:
+                            yield Observation(val, dict(attr_tuple))
+
+                self.meter.create_observable_gauge(name, callbacks=[callback])
+                self.registered_gauges.add(name)
+            return None  # Updates via cache
+        else:
+            return None
+
+        self.instruments[name] = inst
+        return inst
+
+    def log(self, data, step):
+        for key, value in data.items():
+            if key in self.metric_map:
+                otel_name, inst_type, extra_attrs = self.metric_map[key]
+            else:
+                continue
+
+            inst = self._get_instrument(otel_name, inst_type)
+            attrs = {**self.common_attributes, **extra_attrs}
+            attrs["rl.loop.iteration"] = step
+            attr_tuple = frozenset(attrs.items())
+
+            if inst_type == "gauge":
+                self.gauge_cache[(otel_name, attr_tuple)] = value
+            elif inst_type == "counter" and inst:
+                inst.add(value, attrs)
+            elif inst_type == "histogram" and inst:
+                inst.record(value, attrs)
+
+    def finish(self):
+        pass
